@@ -40,7 +40,8 @@ with sqlite3.connect({ledger:?}) as db:
     db.execute('BEGIN IMMEDIATE')
     result = db.execute('INSERT INTO reservations SELECT ?,15000000,NULL WHERE (SELECT COALESCE(SUM(COALESCE(actual,maximum)),0) FROM reservations)+15000000<=25000000', (request['request_id'],))
     approved = result.rowcount == 1
-sys.exit(0 if approved else 1)
+if not approved: sys.exit(1)
+print(json.dumps({{k: request[k] for k in ('protocol_version', 'operation', 'request_id')}}))
 "#
         ),
     );

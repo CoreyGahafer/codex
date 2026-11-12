@@ -3822,10 +3822,12 @@ dependencies = [
 name = "codex-http-client"
 version = "0.167.2"
 dependencies = [
+ "async-stream",
  "bytes",
  "codex-utils-cargo-bin",
  "codex-utils-rustls-provider",
  "curl",
+ "eventsource-stream",
  "futures",
  "http 1.4.0",
  "http-body 1.0.1",

@@ -1175,7 +1175,12 @@ impl ModelClient {
             stream: true,
             stream_options,
             include,
-            service_tier,
+            // A guarded pilot must not inherit a paid tier from project defaults.
+            service_tier: if std::env::var_os("CODEX_REQUEST_GUARD").is_some() {
+                Some("default".into())
+            } else {
+                service_tier
+            },
             prompt_cache_key: self.prompt_cache_key(responses_metadata),
             text,
             client_metadata: Some(client_metadata),

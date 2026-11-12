@@ -83,10 +83,14 @@ impl ReqwestTransport {
         self
     }
 
-    async fn send(&self, req: Request) -> Result<HttpResponse, TransportError> {
-        if let Some(executable) = &self.request_guard {
-            crate::request_guard::authorize(executable, &req).await?;
-        }
+    async fn send(
+        &self,
+        req: Request,
+    ) -> Result<(HttpResponse, Option<crate::request_guard::Receipt>), TransportError> {
+        let receipt = match &self.request_guard {
+            Some(executable) => Some(crate::request_guard::authorize(executable, &req).await?),
+            None => None,
+        };
         let prepared = req.prepare_body_for_send().map_err(TransportError::Build)?;
 
         let Request {
@@ -106,7 +110,7 @@ impl ReqwestTransport {
         *request.request.timeout_mut() = timeout;
         *request.request.body_mut() = prepared.body.map(Into::into);
 
-        match &self.client {
+        let response = match &self.client {
             TransportClient::Fixed(client) => match &client.backend {
                 HttpClientBackend::Routed(pool) => pool
                     .send(request)
@@ -127,7 +131,8 @@ impl ReqwestTransport {
                 .send(request)
                 .await
                 .map_err(Self::map_route_aware_error),
-        }
+        }?;
+        Ok((response, receipt))
     }
 
     fn map_error(err: crate::HttpError) -> TransportError {
@@ -190,7 +195,7 @@ impl HttpTransport for ReqwestTransport {
 
         let url = req.url.clone();
         let response_body_limit_bytes = req.response_body_limit_bytes;
-        let resp = self.send(req).await?;
+        let (resp, receipt) = self.send(req).await?;
         let status = resp.status();
         let headers = resp.headers().clone();
         let retry_after = RetryAfter::from_headers(&headers);
@@ -218,10 +223,16 @@ impl HttpTransport for ReqwestTransport {
                 retry_after,
             });
         }
+        let body = bytes?;
+        if let Some(receipt) = receipt {
+            let response = serde_json::from_slice(&body)
+                .map_err(|_| TransportError::Build("missing usage receipt".into()))?;
+            receipt.settle(&response).await?;
+        }
         Ok(Response {
             status,
             headers,
-            body: bytes?,
+            body,
         })
     }
 
@@ -230,7 +241,7 @@ impl HttpTransport for ReqwestTransport {
 
         let url = req.url.clone();
         let response_body_limit_bytes = req.response_body_limit_bytes;
-        let resp = self.send(req).await?;
+        let (resp, receipt) = self.send(req).await?;
         let status = resp.status();
         let headers = resp.headers().clone();
         if !status.is_success() {
@@ -270,6 +281,10 @@ impl HttpTransport for ReqwestTransport {
                 resp.bytes_stream()
                     .map(|result| result.map_err(Self::map_error)),
             ),
+        };
+        let bytes = match receipt {
+            Some(receipt) => receipt.stream(bytes),
+            None => bytes,
         };
         Ok(StreamResponse {
             status,

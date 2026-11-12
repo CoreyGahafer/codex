@@ -5,6 +5,8 @@ name = "codex-http-client"
 version.workspace = true
 
 [dependencies]
+async-stream = { workspace = true }
+eventsource-stream = { workspace = true }
 bytes = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
 futures = { workspace = true }
