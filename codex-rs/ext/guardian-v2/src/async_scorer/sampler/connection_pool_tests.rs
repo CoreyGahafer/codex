@@ -588,3 +588,41 @@ async fn http_cache_preserves_no_constraint_redirect_policy_and_configured_heade
     );
     Ok(())
 }
+
+#[test]
+fn guarded_mode_rejects_guardian_http_and_websocket_connections() {
+    if std::env::var_os("CODEX_REQUEST_GUARD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", std::thread::current().name().unwrap()])
+            .env("CODEX_REQUEST_GUARD", "/missing-guard")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let sampler = LunaSampler::new(sampler_config(format!(
+            "http://{}/v1",
+            listener.local_addr().unwrap()
+        )));
+        assert!(sampler.connections.replenish().is_none());
+        sampler.prewarm().await;
+        let error = sampler
+            .connections
+            .lease()
+            .await
+            .err()
+            .expect("guard must reject Guardian connections");
+        assert!(error.to_string().contains("request budget guard"));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
+        );
+    });
+}

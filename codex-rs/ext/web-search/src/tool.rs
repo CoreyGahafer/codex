@@ -107,15 +107,15 @@ impl<'call> ToolExecutor<ToolCall<'call>> for WebSearchTool {
 }
 
 impl WebSearchTool {
-    async fn handle_call(
-        &self,
-        call: ToolCall<'_>,
-    ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
-        let commands = parse_commands(call.function_arguments()?, self.supports_literature_search)?;
-        let command_action = command_action(&commands);
+    async fn client(&self) -> Result<SearchClient<ReqwestTransport>, FunctionCallError> {
+        if std::env::var_os("CODEX_REQUEST_GUARD").is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "request budget guard does not support standalone web inference".into(),
+            ));
+        }
         let provider = self.provider.as_ref();
         let first_party = provider_uses_first_party_auth_path(provider.info());
-        let client = prepare_provider_request(provider, first_party, |_| async {
+        prepare_provider_request(provider, first_party, |_| async {
             let routing_auth = if first_party {
                 provider.auth().await
             } else {
@@ -151,7 +151,16 @@ impl WebSearchTool {
             Ok(SearchClient::new(transport, endpoint, api_auth))
         })
         .await
-        .map_err(|err| FunctionCallError::RespondToModel(search_error_message(err)))?;
+        .map_err(|err| FunctionCallError::RespondToModel(search_error_message(err)))
+    }
+
+    async fn handle_call(
+        &self,
+        call: ToolCall<'_>,
+    ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+        let commands = parse_commands(call.function_arguments()?, self.supports_literature_search)?;
+        let command_action = command_action(&commands);
+        let client = self.client().await?;
         let request = SearchRequest {
             id: self.session_id.clone(),
             model: call.model.clone(),
@@ -339,6 +348,47 @@ mod tests {
     use super::search_request_headers;
     use codex_core::X_CODEX_TURN_METADATA_HEADER;
     use codex_extension_api::FunctionCallError;
+
+    #[test]
+    fn guarded_mode_rejects_standalone_search_client() {
+        if std::env::var_os("CODEX_REQUEST_GUARD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env("CODEX_REQUEST_GUARD", "/missing-guard")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let tool = super::WebSearchTool {
+            session_id: "fixture".into(),
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
+            provider: codex_model_provider::create_model_provider(
+                codex_model_provider_info::ModelProviderInfo::create_openai_provider(Some(
+                    "http://127.0.0.1:1/v1".into(),
+                )),
+                None,
+            ),
+            workspace_routing: std::sync::Arc::new(
+                codex_model_provider::WorkspaceRoutingContext::new("http://127.0.0.1:1".into()),
+            ),
+            settings: Default::default(),
+            supports_literature_search: false,
+            originator: None,
+        };
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let error = tool.client().await.err().expect("guard must reject search client");
+            assert!(matches!(error, FunctionCallError::RespondToModel(message) if message.contains("request budget guard")));
+        });
+    }
 
     #[test]
     fn search_errors_preserve_short_messages_and_bound_utf8_output() {

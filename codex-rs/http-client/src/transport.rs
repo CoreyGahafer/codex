@@ -47,6 +47,7 @@ pub trait HttpTransport: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct ReqwestTransport {
     client: TransportClient,
+    request_guard: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +64,7 @@ impl ReqwestTransport {
     pub fn from_http_client(client: HttpClient) -> Self {
         Self {
             client: TransportClient::Fixed(client),
+            request_guard: None,
         }
     }
 
@@ -70,10 +72,25 @@ impl ReqwestTransport {
     pub fn from_route_aware_client_pool(client: RouteAwareClientPool) -> Self {
         Self {
             client: TransportClient::RouteAware(Box::new(client)),
+            request_guard: None,
         }
     }
 
-    async fn send(&self, req: Request) -> Result<HttpResponse, TransportError> {
+    /// Requires the trusted executable to reserve this attempt before allowing dispatch.
+    /// The caller must disable redirects so one authorization cannot fund another destination.
+    pub fn with_request_guard(mut self, executable: std::path::PathBuf) -> Self {
+        self.request_guard = Some(executable);
+        self
+    }
+
+    async fn send(
+        &self,
+        req: Request,
+    ) -> Result<(HttpResponse, Option<crate::request_guard::Receipt>), TransportError> {
+        let receipt = match &self.request_guard {
+            Some(executable) => Some(crate::request_guard::authorize(executable, &req).await?),
+            None => None,
+        };
         let prepared = req.prepare_body_for_send().map_err(TransportError::Build)?;
 
         let Request {
@@ -93,7 +110,7 @@ impl ReqwestTransport {
         *request.request.timeout_mut() = timeout;
         *request.request.body_mut() = prepared.body.map(Into::into);
 
-        match &self.client {
+        let response = match &self.client {
             TransportClient::Fixed(client) => match &client.backend {
                 HttpClientBackend::Routed(pool) => pool
                     .send(request)
@@ -114,7 +131,8 @@ impl ReqwestTransport {
                 .send(request)
                 .await
                 .map_err(Self::map_route_aware_error),
-        }
+        }?;
+        Ok((response, receipt))
     }
 
     fn map_error(err: crate::HttpError) -> TransportError {
@@ -177,7 +195,7 @@ impl HttpTransport for ReqwestTransport {
 
         let url = req.url.clone();
         let response_body_limit_bytes = req.response_body_limit_bytes;
-        let resp = self.send(req).await?;
+        let (resp, receipt) = self.send(req).await?;
         let status = resp.status();
         let headers = resp.headers().clone();
         let retry_after = RetryAfter::from_headers(&headers);
@@ -205,10 +223,16 @@ impl HttpTransport for ReqwestTransport {
                 retry_after,
             });
         }
+        let body = bytes?;
+        if let Some(receipt) = receipt {
+            let response = serde_json::from_slice(&body)
+                .map_err(|_| TransportError::Build("missing usage receipt".into()))?;
+            receipt.settle(&response).await?;
+        }
         Ok(Response {
             status,
             headers,
-            body: bytes?,
+            body,
         })
     }
 
@@ -217,7 +241,7 @@ impl HttpTransport for ReqwestTransport {
 
         let url = req.url.clone();
         let response_body_limit_bytes = req.response_body_limit_bytes;
-        let resp = self.send(req).await?;
+        let (resp, receipt) = self.send(req).await?;
         let status = resp.status();
         let headers = resp.headers().clone();
         if !status.is_success() {
@@ -257,6 +281,10 @@ impl HttpTransport for ReqwestTransport {
                 resp.bytes_stream()
                     .map(|result| result.map_err(Self::map_error)),
             ),
+        };
+        let bytes = match receipt {
+            Some(receipt) => receipt.stream(bytes),
+            None => bytes,
         };
         Ok(StreamResponse {
             status,

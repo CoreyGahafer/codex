@@ -15,6 +15,7 @@ mod openai_endpoints;
 mod openai_headers;
 mod outbound_proxy;
 mod request;
+mod request_guard;
 mod request_builder;
 mod request_draft;
 mod response;

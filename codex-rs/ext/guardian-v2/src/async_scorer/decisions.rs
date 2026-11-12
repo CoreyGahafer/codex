@@ -105,6 +105,9 @@ impl DecisionsSampler {
         api_key: String,
         url: String,
     ) -> Result<Self, DecisionsError> {
+        if std::env::var_os("CODEX_REQUEST_GUARD").is_some() {
+            return Err(DecisionsError::ClientSetup);
+        }
         if api_key.trim().is_empty() {
             return Err(DecisionsError::Credentials);
         }

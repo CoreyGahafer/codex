@@ -124,3 +124,46 @@ let transport = ReqwestTransport::from_http_client(client);
 
 If the existing wrapper surface cannot support a use case, extend `codex-http-client` rather than
 adding a direct `reqwest` dependency to another first-party crate.
+
+## Experimental native request guard
+
+The pilot runtime can set `CODEX_REQUEST_GUARD` to an absolute executable path.
+Core attaches it to each Responses HTTP transport, rejects other inference endpoints,
+disables Responses WebSockets, and rejects redirects while the variable is set. Standalone
+image and web inference, Guardian scoring, and its Decisions comparison are rejected
+before dispatch because their independent paths are not funded by this prototype. Normal
+runtime behavior is unchanged when it is absent. This is an admission prototype, not
+a completed paid-evaluation runner.
+
+Before each transport attempt (including retries and compaction Responses), the
+executable receives one JSON object on stdin: `protocol_version` (2), `operation` ("reserve"), a fresh
+`request_id`, HTTP `method`, `origin`, `path`, `model`, `max_output_tokens`,
+`tool_types`, `service_tier`, `cache_control_count`, and uncompressed `body_bytes`. Missing metadata is null. Headers,
+query strings, and conversation text are omitted. JSON bodies, including prepared
+zstd bodies, are decoded with a 16 MiB ceiling; other encodings fail closed.
+
+The executable must atomically reserve the verified worst-case cost in the shared
+ledger before exiting zero and returning a JSON acknowledgment containing the same
+`protocol_version`, `operation`, and `request_id`. Legacy exit-zero-only guards fail closed. It must reject unknown models, pricing, bounds, billable
+tools, and endpoints. A missing output-token bound requires the verified model
+maximum, not an assumed small completion. Nonzero exit, launch failure, cancellation,
+or the five-second deadline prevents dispatch. The trusted guard runs without the
+runtime's environment or credentials; put ledger/pricing paths in its own protected
+configuration, and keep its executable and configuration outside agent-writable paths.
+
+For successful buffered responses and terminal Responses SSE events, a second callback
+uses `operation: "settle"`, the same request ID, and response metadata (`id`, `model`,
+`status`, `service_tier`, `usage`). The guard must validate and commit reconciliation
+before acknowledging it. The transport withholds the terminal response until that
+acknowledgment. Guarded SSE decoding is bounded to 16 MiB per response; unguarded
+stream bytes remain unchanged. Guarded core Responses explicitly request the default
+service tier. A response lacking trustworthy metadata must be refused by the adapter.
+
+Transport errors, unsuccessful HTTP responses, cancellation, missing terminal events,
+and ambiguous callback completion retain reservations. This protocol does not authorize
+paid execution or establish invoice totals. The executor must also fund classifier
+calls, corrections, and every other billable operation against the same ledger. A guard can admit only the requests it can conservatively
+fund; it must deny rather than weaken the spending rules.
+
+`ReqwestTransport::with_request_guard` gates transport attempts; callers other than
+core must also disable redirects on their HTTP client.
