@@ -429,3 +429,30 @@ async fn cancelling_a_decisions_request_releases_thread_capacity() {
     .unwrap();
     drop(permit);
 }
+
+#[test]
+fn guarded_mode_rejects_the_guardian_decisions_comparison() {
+    if std::env::var_os("CODEX_REQUEST_GUARD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", std::thread::current().name().unwrap()])
+            .env("CODEX_REQUEST_GUARD", "/missing-guard")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let client = HttpClientBuilder::new().build_direct().unwrap();
+    assert!(matches!(
+        DecisionsSampler::new(
+            client,
+            "fixture-key".into(),
+            "http://127.0.0.1:1/v1/decisions".into()
+        ),
+        Err(DecisionsError::ClientSetup)
+    ));
+}

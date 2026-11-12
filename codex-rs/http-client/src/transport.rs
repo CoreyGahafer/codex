@@ -47,6 +47,7 @@ pub trait HttpTransport: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct ReqwestTransport {
     client: TransportClient,
+    request_guard: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +64,7 @@ impl ReqwestTransport {
     pub fn from_http_client(client: HttpClient) -> Self {
         Self {
             client: TransportClient::Fixed(client),
+            request_guard: None,
         }
     }
 
@@ -70,10 +72,21 @@ impl ReqwestTransport {
     pub fn from_route_aware_client_pool(client: RouteAwareClientPool) -> Self {
         Self {
             client: TransportClient::RouteAware(Box::new(client)),
+            request_guard: None,
         }
     }
 
+    /// Requires the trusted executable to reserve this attempt before allowing dispatch.
+    /// The caller must disable redirects so one authorization cannot fund another destination.
+    pub fn with_request_guard(mut self, executable: std::path::PathBuf) -> Self {
+        self.request_guard = Some(executable);
+        self
+    }
+
     async fn send(&self, req: Request) -> Result<HttpResponse, TransportError> {
+        if let Some(executable) = &self.request_guard {
+            crate::request_guard::authorize(executable, &req).await?;
+        }
         let prepared = req.prepare_body_for_send().map_err(TransportError::Build)?;
 
         let Request {

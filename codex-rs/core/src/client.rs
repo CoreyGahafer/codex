@@ -254,9 +254,16 @@ struct CurrentClientSetup {
 impl CurrentClientSetup {
     fn build_api_transport(&self, endpoint: &str) -> Result<ReqwestTransport> {
         let api_provider = &self.api_provider;
-        let redirect_policy = if api_provider
-            .headers
-            .contains_key(codex_model_provider::ACCOUNT_ROUTING_HEADER)
+        let request_guard = std::env::var_os("CODEX_REQUEST_GUARD");
+        if request_guard.is_some() && endpoint != "/responses" {
+            return Err(CodexErr::Fatal(
+                "request budget guard supports only Responses inference".into(),
+            ));
+        }
+        let redirect_policy = if request_guard.is_some()
+            || api_provider
+                .headers
+                .contains_key(codex_model_provider::ACCOUNT_ROUTING_HEADER)
         {
             ClientRedirectPolicy::Reject
         } else {
@@ -269,7 +276,11 @@ impl CurrentClientSetup {
             redirect_policy,
         )
         .map_err(std::io::Error::from)?;
-        Ok(ReqwestTransport::from_http_client(client))
+        let mut transport = ReqwestTransport::from_http_client(client);
+        if let Some(executable) = request_guard {
+            transport = transport.with_request_guard(executable.into());
+        }
+        Ok(transport)
     }
 }
 
@@ -1188,7 +1199,8 @@ impl ModelClient {
     ///
     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
     pub fn responses_websocket_enabled(&self) -> bool {
-        if !self.state.provider.info().supports_websockets
+        if std::env::var_os("CODEX_REQUEST_GUARD").is_some()
+            || !self.state.provider.info().supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
         {
             return false;

@@ -148,6 +148,9 @@ impl ConnectionPool {
     }
 
     fn start_refill(self: &Arc<Self>, guard: OwnedMutexGuard<()>) -> Option<JoinHandle<()>> {
+        if std::env::var_os("CODEX_REQUEST_GUARD").is_some() {
+            return None;
+        }
         let mut retry_after = self
             .retry_after
             .lock()
@@ -209,6 +212,13 @@ impl ConnectionPool {
     }
 
     pub(super) async fn lease(self: &Arc<Self>) -> Result<ConnectionLease, LunaSamplerError> {
+        if std::env::var_os("CODEX_REQUEST_GUARD").is_some() {
+            return Err(LunaSamplerError::Api(ApiError::Transport(
+                TransportError::Build(
+                    "request budget guard does not support Guardian scoring".into(),
+                ),
+            )));
+        }
         let started = Instant::now();
         let permit = Arc::clone(&self.classifications)
             .acquire_owned()

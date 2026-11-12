@@ -126,3 +126,103 @@ impl Write for TestLogWriter {
         Ok(())
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn request_guard_denies_before_http_dispatch() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let guard = directory.path().join("deny");
+    std::fs::write(&guard, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    for guard in [
+        guard,
+        directory.path().join("missing"),
+        std::path::PathBuf::from("relative-guard"),
+    ] {
+        for streaming in [false, true] {
+            let transport =
+                ReqwestTransport::new(test_reqwest_client()).with_request_guard(guard.clone());
+            let mut request = Request::new(
+                Method::POST,
+                format!("http://{}/v1/responses", listener.local_addr().unwrap()),
+            );
+            request.timeout = Some(Duration::from_millis(100));
+            let error = if streaming {
+                transport.stream(request).await.err()
+            } else {
+                transport.execute(request).await.err()
+            }
+            .expect("guard must deny");
+            assert!(
+                error.to_string().contains("request budget guard"),
+                "{error}"
+            );
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn executable_guard(
+    directory: &std::path::Path,
+    script: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = directory.join("guard");
+    std::fs::write(&path, script)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn request_guard_cancellation_and_timeout_kill_the_guard_without_dispatch() {
+    use tokio::io::AsyncReadExt;
+    for timeout in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("ready.sock");
+        let ready = tokio::net::UnixListener::bind(&socket).unwrap();
+        let guard_result = executable_guard(
+            directory.path(),
+            &format!(
+                r#"#!/usr/bin/python3
+import json, socket, sys
+json.load(sys.stdin)
+s = socket.socket(socket.AF_UNIX)
+s.connect({socket:?})
+s.sendall(b'S')
+s.recv(1)
+"#
+            ),
+        );
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let transport =
+            ReqwestTransport::new(test_reqwest_client()).with_request_guard(guard_result.unwrap());
+        let request = Request::new(
+            Method::POST,
+            format!("http://{}/v1/responses", listener.local_addr().unwrap()),
+        );
+        let task = tokio::spawn(async move { transport.execute(request).await });
+        let (mut connected, _) = ready.accept().await.unwrap();
+        assert_eq!(connected.read_u8().await.unwrap(), b'S');
+        if timeout {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert!(matches!(task.await.unwrap(), Err(TransportError::Build(_))));
+            tokio::time::resume();
+        } else {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(connected.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
+        );
+    }
+}

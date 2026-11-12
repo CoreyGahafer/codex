@@ -78,6 +78,11 @@ impl CodexImagesBackend {
 
     /// Resolves the provider and auth required for the current image API request.
     async fn client(&self) -> Result<ImagesClient<ReqwestTransport>, ImageBackendError> {
+        if std::env::var_os("CODEX_REQUEST_GUARD").is_some() {
+            return Err(ImageBackendError::from_message(
+                "request budget guard does not support standalone image inference".into(),
+            ));
+        }
         let (provider, auth) = self
             .provider
             .api_provider_and_auth()
@@ -147,4 +152,46 @@ fn image_request_headers(
     }
 
     headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guarded_mode_rejects_image_client_before_provider_setup() {
+        if std::env::var_os("CODEX_REQUEST_GUARD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env("CODEX_REQUEST_GUARD", "/missing-guard")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let backend = CodexImagesBackend::new(
+            codex_model_provider::create_model_provider(
+                codex_model_provider_info::ModelProviderInfo::create_openai_provider(Some(
+                    "http://127.0.0.1:1/v1".into(),
+                )),
+                None,
+            ),
+            HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+            None,
+        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let error = backend
+                .client()
+                .await
+                .err()
+                .expect("guard must reject the image client");
+            assert!(error.message().contains("request budget guard"));
+        });
+    }
 }
